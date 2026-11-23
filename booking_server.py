@@ -14,13 +14,14 @@ notify you on Telegram/Slack, reminders).
 
 Setup:
   pip install fastapi uvicorn google-api-python-client google-auth requests
-  export GOOGLE_SERVICE_ACCOUNT_FILE=service-account.json   # share your calendar with this account
+  export GOOGLE_SERVICE_ACCOUNT_JSON="$(cat service-account.json)"   # or GOOGLE_SERVICE_ACCOUNT_FILE=path
   export CALENDAR_ID=you@yourbusiness.com                    # or the calendar's ID
   export TOOL_SECRET=some-long-random-string                 # put ?key=... on the tool URLs
   export OPENCLAW_HOOK_URL=...                               # optional, see guide
   uvicorn booking_server:app --host 0.0.0.0 --port 8000
 """
 
+import json
 import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -30,9 +31,20 @@ from fastapi import FastAPI, HTTPException, Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-TZ = ZoneInfo(os.getenv("BUSINESS_TZ", "America/Edmonton"))
-CALENDAR_ID = os.environ["CALENDAR_ID"]
-TOOL_SECRET = os.environ["TOOL_SECRET"]
+# Check settings up front so a missing one gives a clear message, not a crash.
+_missing = [v for v in ("CALENDAR_ID", "TOOL_SECRET") if not os.getenv(v, "").strip()]
+if not (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip() or os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()):
+    _missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+if _missing:
+    raise SystemExit(
+        "\n*** Missing settings: " + ", ".join(_missing) + " ***\n"
+        "Add them in Railway: click your service > Variables tab > New Variable, "
+        "then click Deploy to apply.\n"
+    )
+
+TZ = ZoneInfo(os.getenv("BUSINESS_TZ", "America/Edmonton").strip())
+CALENDAR_ID = os.environ["CALENDAR_ID"].strip()
+TOOL_SECRET = os.environ["TOOL_SECRET"].strip()
 OPENCLAW_HOOK_URL = os.getenv("OPENCLAW_HOOK_URL")
 OPENCLAW_HOOK_TOKEN = os.getenv("OPENCLAW_HOOK_TOKEN")
 
@@ -90,13 +102,32 @@ def rule_violation(start: datetime, length: timedelta) -> str | None:
         return f"That's outside our hours. {HOURS_SPOKEN}"
     return None
 
-creds = service_account.Credentials.from_service_account_file(
-    os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"],
-    scopes=["https://www.googleapis.com/auth/calendar"],
-)
+_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+def _load_key_json(text: str) -> dict:
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        raise SystemExit(
+            "\n*** GOOGLE_SERVICE_ACCOUNT_JSON isn't valid. Open the downloaded key file in a "
+            "text editor and paste ALL of it, from the first { to the last }. ***\n"
+        )
+if os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+    # Hosting-friendly: paste the whole key file's contents into this env variable.
+    creds = service_account.Credentials.from_service_account_info(
+        _load_key_json(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]), scopes=_SCOPES)
+else:
+    creds = service_account.Credentials.from_service_account_file(
+        os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"], scopes=_SCOPES)
 cal = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 app = FastAPI()
+
+
+@app.get("/")
+def health():
+    return {"ok": True, "hours": HOURS_SPOKEN}
 
 
 def check_key(request: Request):
@@ -107,6 +138,8 @@ def check_key(request: Request):
 async def tool_args(request: Request) -> dict:
     """Accept either the raw arguments or an {"arguments": {...}} wrapper."""
     body = await request.json()
+    # Shows up in Railway's logs so you can see exactly what the agent sent.
+    print(f"[tool] {request.url.path} <- {json.dumps(body)[:500]}", flush=True)
     return body.get("arguments", body) if isinstance(body, dict) else {}
 
 
@@ -208,6 +241,21 @@ def find_options(day, length, preferred=None, search_days=14):
         "next_available": next_days,
         **({} if next_days else {"note": f"Nothing open in the next {search_days} days. Offer to take a message."}),
     }
+
+
+@app.post("/tools/get_today")
+async def get_today(request: Request):
+    """The agent calls this first so it can turn "next Tuesday" into a real date."""
+    check_key(request)
+    now = datetime.now(TZ)
+    upcoming = [
+        {"date": str((now + timedelta(days=i)).date()),
+         "weekday": DAY_NAMES[(now + timedelta(days=i)).weekday()],
+         "open": is_open_day((now + timedelta(days=i)).date())}
+        for i in range(14)
+    ]
+    return {"today": str(now.date()), "weekday": DAY_NAMES[now.weekday()],
+            "time_now": now.strftime("%H:%M"), "hours": HOURS_SPOKEN, "next_14_days": upcoming}
 
 
 @app.post("/tools/check_availability")
