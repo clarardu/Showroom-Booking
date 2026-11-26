@@ -538,3 +538,175 @@ async def twilio_stream(twilio_ws: WebSocket):
             await twilio_ws.close()
         except Exception:
             pass
+
+
+# ===========================================================================
+# BROWSER TEST PAGE (free: no Twilio needed)
+# Open https://YOUR-SERVER-URL/talk?key=YOUR_TOOL_SECRET in Chrome, click Start,
+# and talk to your agent through your microphone. Same agent, same tools,
+# real bookings in your calendar. Uses the ASSEMBLYAI_API_KEY and AGENT_ID variables.
+# ===========================================================================
+
+from fastapi.responses import HTMLResponse
+
+_TALK_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Talk to your receptionist</title>
+<style>
+  body{font-family:-apple-system,system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#1d1d1f}
+  h1{font-size:22px;margin-bottom:4px} p{color:#555;line-height:1.5}
+  button{font-size:17px;padding:12px 28px;border-radius:24px;border:none;background:#1d1d1f;color:#fff;cursor:pointer}
+  button.stop{background:#c0392b} #status{margin:16px 0;font-weight:600}
+  #log{border-top:1px solid #ddd;margin-top:16px;padding-top:8px}
+  .line{margin:8px 0;line-height:1.4} .you{color:#0a58ca} .agent{color:#1d1d1f} .sys{color:#888;font-size:14px}
+</style></head><body>
+<h1>Talk to your receptionist</h1>
+<p>Click Start, allow the microphone, and talk as if you were a customer calling. Bookings it makes are real, so delete test events from your calendar afterwards. Headphones work best.</p>
+<button id="btn">Start</button>
+<div id="status">Not connected</div>
+<div id="log"></div>
+<script>
+const KEY = new URLSearchParams(location.search).get("key") || "";
+const btn = document.getElementById("btn"), statusEl = document.getElementById("status"), logEl = document.getElementById("log");
+let ws, ctx, micStream, proc, src, playing = [], playHead = 0;
+
+function log(cls, text){ const d=document.createElement("div"); d.className="line "+cls; d.textContent=text; logEl.prepend(d); }
+function b64(buf){ let s="", b=new Uint8Array(buf); for(let i=0;i<b.length;i+=0x8000) s+=String.fromCharCode.apply(null,b.subarray(i,i+0x8000)); return btoa(s); }
+function unb64(s){ const bin=atob(s), out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out.buffer; }
+
+function stopPlayback(){ playing.forEach(n=>{try{n.stop()}catch(e){}}); playing=[]; playHead=ctx?ctx.currentTime:0; }
+function play(pcmBuf){
+  const i16=new Int16Array(pcmBuf), f32=new Float32Array(i16.length);
+  for(let i=0;i<i16.length;i++) f32[i]=i16[i]/32768;
+  const ab=ctx.createBuffer(1,f32.length,24000); ab.copyToChannel(f32,0);
+  const n=ctx.createBufferSource(); n.buffer=ab; n.connect(ctx.destination);
+  playHead=Math.max(playHead, ctx.currentTime+0.05); n.start(playHead); playHead+=ab.duration;
+  playing.push(n); n.onended=()=>{playing=playing.filter(x=>x!==n)};
+}
+
+async function start(){
+  btn.disabled=true; statusEl.textContent="Connecting...";
+  try{
+    micStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
+  }catch(e){ statusEl.textContent="Microphone blocked. Allow it in the browser's address bar and reload."; btn.disabled=false; return; }
+  ctx = new AudioContext({sampleRate:24000});
+  ws = new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/talk/ws?key="+encodeURIComponent(KEY));
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if(m.type==="ready"){ statusEl.textContent="Connected - start talking"; btn.textContent="Hang up"; btn.className="stop"; btn.disabled=false; }
+    else if(m.type==="audio") play(unb64(m.audio));
+    else if(m.type==="clear") stopPlayback();
+    else if(m.type==="transcript") log(m.who==="caller"?"you":"agent",(m.who==="caller"?"You: ":"Agent: ")+m.text);
+    else if(m.type==="tool") log("sys","[checking: "+m.name+"]");
+    else if(m.type==="error") { log("sys","Error: "+m.message); }
+  };
+  ws.onclose = () => { statusEl.textContent="Disconnected"; cleanup(); };
+  src = ctx.createMediaStreamSource(micStream);
+  proc = ctx.createScriptProcessor(2048,1,1);
+  proc.onaudioprocess = e => {
+    if(!ws || ws.readyState!==1) return;
+    const f=e.inputBuffer.getChannelData(0), i16=new Int16Array(f.length);
+    for(let i=0;i<f.length;i++){ const v=Math.max(-1,Math.min(1,f[i])); i16[i]=v<0?v*0x8000:v*0x7fff; }
+    ws.send(JSON.stringify({type:"audio",audio:b64(i16.buffer)}));
+  };
+  const mute=ctx.createGain(); mute.gain.value=0;   // keep the processor running without echoing the mic
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+}
+function cleanup(){
+  try{proc&&proc.disconnect()}catch(e){} try{src&&src.disconnect()}catch(e){}
+  micStream&&micStream.getTracks().forEach(t=>t.stop()); stopPlayback();
+  try{ctx&&ctx.close()}catch(e){} ws=null; btn.textContent="Start"; btn.className=""; btn.disabled=false;
+}
+btn.onclick = () => { if(ws){ ws.close(); } else { start(); } };
+</script></body></html>"""
+
+
+@app.get("/talk")
+async def talk_page(request: Request):
+    check_key(request)
+    return HTMLResponse(_TALK_PAGE)
+
+
+@app.websocket("/talk/ws")
+async def talk_ws(browser_ws: WebSocket):
+    await browser_ws.accept()
+    if browser_ws.query_params.get("key") != TOOL_SECRET:
+        await browser_ws.send_text(json.dumps({"type": "error", "message": "Wrong key in the page address."}))
+        await browser_ws.close()
+        return
+    if not (AAI_API_KEY and AGENT_ID):
+        await browser_ws.send_text(json.dumps({"type": "error",
+            "message": "Add ASSEMBLYAI_API_KEY and AGENT_ID in Railway Variables, then redeploy."}))
+        await browser_ws.close()
+        return
+
+    print("[talk] browser session started", flush=True)
+    try:
+        async with websockets.connect(
+            AAI_WS_URL, additional_headers={"Authorization": f"Bearer {AAI_API_KEY}"}
+        ) as aai_ws:
+            await aai_ws.send(json.dumps({"type": "session.update", "session": {"agent_id": AGENT_ID}}))
+            ready = asyncio.Event()
+
+            async def browser_to_agent():
+                while True:
+                    msg = json.loads(await browser_ws.receive_text())
+                    if msg.get("type") == "audio" and ready.is_set():
+                        await aai_ws.send(json.dumps({"type": "input.audio", "audio": msg["audio"]}))
+
+            async def agent_to_browser():
+                async for raw in aai_ws:
+                    msg = json.loads(raw)
+                    kind = msg.get("type")
+                    if kind == "session.ready":
+                        ready.set()
+                        await browser_ws.send_text(json.dumps({"type": "ready"}))
+                        print("[talk] agent ready", flush=True)
+                    elif kind == "reply.audio":
+                        audio = msg.get("data") or msg.get("audio")
+                        if audio:
+                            await browser_ws.send_text(json.dumps({"type": "audio", "audio": audio}))
+                    elif kind == "input.speech.started" or (
+                            kind == "reply.done" and msg.get("status") == "interrupted"):
+                        await browser_ws.send_text(json.dumps({"type": "clear"}))
+                    elif kind in ("transcript.user", "transcript.agent"):
+                        who = "caller" if kind == "transcript.user" else "agent"
+                        text = msg.get("text", "")
+                        print(f"[talk] {who}: {text}", flush=True)
+                        await browser_ws.send_text(json.dumps({"type": "transcript", "who": who, "text": text}))
+                    elif kind in ("tool.call", "tool_call"):
+                        await browser_ws.send_text(json.dumps({"type": "tool", "name": msg.get("name", "a tool")}))
+                    elif kind in ("session.error", "error"):
+                        print(f"[talk] AssemblyAI error: {json.dumps(msg)[:500]}", flush=True)
+                        await browser_ws.send_text(json.dumps({"type": "error",
+                            "message": str(msg.get("message") or msg.get("error") or msg)[:300]}))
+                    elif kind == "session.ended":
+                        return
+
+            tasks = [asyncio.create_task(browser_to_agent()), asyncio.create_task(agent_to_browser())]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                if t.exception() and not isinstance(t.exception(), (WebSocketDisconnect, websockets.ConnectionClosed)):
+                    print(f"[talk] bridge error: {t.exception()!r}", flush=True)
+            try:
+                await aai_ws.send(json.dumps({"type": "session.end"}))
+            except websockets.ConnectionClosed:
+                pass
+    except websockets.InvalidStatus as e:
+        note = (f"AssemblyAI refused the connection ({e.response.status_code}). "
+                "Check ASSEMBLYAI_API_KEY and AGENT_ID, or set AAI_WS_URL to wss://agents.assemblyai.com/v1/ws.")
+        print(f"[talk] {note}", flush=True)
+        try:
+            await browser_ws.send_text(json.dumps({"type": "error", "message": note}))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[talk] error: {e!r}", flush=True)
+    finally:
+        print("[talk] browser session ended", flush=True)
+        try:
+            await browser_ws.close()
+        except Exception:
+            pass
