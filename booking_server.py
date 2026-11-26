@@ -355,3 +355,186 @@ async def book_appointment(request: Request):
             pass  # booking already succeeded; don't fail the call over a notification
 
     return {"booked": True, "start": spoken(start), "event_id": event["id"]}
+
+
+# ===========================================================================
+# PHONE BRIDGE (works on a free Twilio trial - no SIP trunk needed)
+#
+# Twilio answers the call and streams its audio here over a WebSocket; this
+# server passes it to your AssemblyAI agent and plays the agent's voice back.
+# The agent still books through the HTTP tools above, exactly as before.
+#
+# Extra Railway variables needed for this part:
+#   ASSEMBLYAI_API_KEY   your AssemblyAI API key
+#   AGENT_ID             the "id" you got when you created the agent
+# Twilio setup: on your number, set "A call comes in" to Webhook, HTTP POST,
+#   https://YOUR-SERVER-URL/twilio/voice?key=YOUR_TOOL_SECRET
+# ===========================================================================
+
+import asyncio
+import base64
+from xml.sax.saxutils import escape as _xml_escape
+
+import numpy as np
+import websockets
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+
+AAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
+AGENT_ID = os.getenv("AGENT_ID", "").strip()
+# Agents made on agents.us.assemblyai.com live in the US region.
+AAI_WS_URL = os.getenv("AAI_WS_URL", "wss://agents.us.assemblyai.com/v1/ws").strip()
+
+# --- audio conversion: Twilio sends 8 kHz mu-law, the agent uses 24 kHz PCM16 ---
+_BIAS, _CLIP = 0x84, 32635
+
+
+def _build_ulaw_table():
+    table = np.zeros(256, dtype=np.int16)
+    for i in range(256):
+        u = ~i & 0xFF
+        sign, exponent, mantissa = u & 0x80, (u >> 4) & 0x07, u & 0x0F
+        sample = (((mantissa << 3) + _BIAS) << exponent) - _BIAS
+        table[i] = -sample if sign else sample
+    return table
+
+
+_ULAW_TO_PCM = _build_ulaw_table()
+
+
+def ulaw8k_to_pcm24k(data: bytes) -> bytes:
+    pcm = _ULAW_TO_PCM[np.frombuffer(data, dtype=np.uint8)].astype(np.float32)
+    if pcm.size == 0:
+        return b""
+    # 8k -> 24k: linear interpolation, 3 output samples per input sample
+    x_old = np.arange(pcm.size)
+    x_new = np.arange(pcm.size * 3) / 3.0
+    up = np.interp(x_new, x_old, pcm)
+    return up.astype(np.int16).tobytes()
+
+
+def pcm24k_to_ulaw8k(data: bytes) -> bytes:
+    pcm = np.frombuffer(data[: len(data) - len(data) % 2], dtype=np.int16).astype(np.int32)
+    n = pcm.size - pcm.size % 3
+    if n == 0:
+        return b""
+    # 24k -> 8k: average each group of 3 samples (simple low-pass + decimate)
+    down = pcm[:n].reshape(-1, 3).mean(axis=1).astype(np.int32)
+    sign = (down < 0)
+    mag = np.minimum(np.abs(down), _CLIP) + _BIAS
+    exponent = np.clip(np.floor(np.log2(mag)).astype(np.int32) - 7, 0, 7)
+    mantissa = (mag >> (exponent + 3)) & 0x0F
+    ulaw = ~((sign.astype(np.int32) << 7) | (exponent << 4) | mantissa) & 0xFF
+    return ulaw.astype(np.uint8).tobytes()
+
+
+@app.post("/twilio/voice")
+async def twilio_voice(request: Request):
+    """Twilio calls this when someone rings your number; we tell it to stream the call here."""
+    check_key(request)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    stream_url = f"wss://{host}/twilio/stream"
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
+        f'<Stream url="{_xml_escape(stream_url)}">'
+        f'<Parameter name="key" value="{_xml_escape(TOOL_SECRET)}"/>'
+        "</Stream></Connect></Response>"
+    )
+    return Response(content=twiml, media_type="text/xml")
+
+
+@app.websocket("/twilio/stream")
+async def twilio_stream(twilio_ws: WebSocket):
+    await twilio_ws.accept()
+    stream_sid = None
+
+    # Wait for Twilio's "start" message, which carries the stream id and our key.
+    try:
+        while stream_sid is None:
+            msg = json.loads(await twilio_ws.receive_text())
+            if msg.get("event") == "start":
+                start = msg["start"]
+                if start.get("customParameters", {}).get("key") != TOOL_SECRET:
+                    print("[call] rejected: bad key", flush=True)
+                    await twilio_ws.close()
+                    return
+                stream_sid = start["streamSid"]
+    except (WebSocketDisconnect, KeyError, json.JSONDecodeError):
+        return
+
+    if not (AAI_API_KEY and AGENT_ID):
+        print("[call] ASSEMBLYAI_API_KEY or AGENT_ID missing in Railway variables", flush=True)
+        await twilio_ws.close()
+        return
+
+    print(f"[call] started {stream_sid}", flush=True)
+    try:
+        async with websockets.connect(
+            AAI_WS_URL, additional_headers={"Authorization": f"Bearer {AAI_API_KEY}"}
+        ) as aai_ws:
+            await aai_ws.send(json.dumps({"type": "session.update", "session": {"agent_id": AGENT_ID}}))
+            ready = asyncio.Event()
+
+            async def caller_to_agent():
+                while True:
+                    msg = json.loads(await twilio_ws.receive_text())
+                    event = msg.get("event")
+                    if event == "media" and ready.is_set():
+                        pcm = ulaw8k_to_pcm24k(base64.b64decode(msg["media"]["payload"]))
+                        await aai_ws.send(json.dumps(
+                            {"type": "input.audio", "audio": base64.b64encode(pcm).decode()}))
+                    elif event == "stop":
+                        return
+
+            async def agent_to_caller():
+                leftover = b""
+                async for raw in aai_ws:
+                    msg = json.loads(raw)
+                    kind = msg.get("type")
+                    if kind == "session.ready":
+                        ready.set()
+                        print("[call] agent ready", flush=True)
+                    elif kind == "reply.audio":
+                        pcm = leftover + base64.b64decode(msg.get("data") or msg.get("audio") or "")
+                        cut = len(pcm) - len(pcm) % 6   # whole 3-sample groups only
+                        pcm, leftover = pcm[:cut], pcm[cut:]
+                        ulaw = pcm24k_to_ulaw8k(pcm)
+                        if ulaw:
+                            await twilio_ws.send_text(json.dumps({
+                                "event": "media", "streamSid": stream_sid,
+                                "media": {"payload": base64.b64encode(ulaw).decode()}}))
+                    elif kind == "input.speech.started" or (
+                            kind == "reply.done" and msg.get("status") == "interrupted"):
+                        # Caller started talking: stop playing the agent's queued audio.
+                        leftover = b""
+                        await twilio_ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+                    elif kind in ("transcript.user", "transcript.agent"):
+                        who = "caller" if kind == "transcript.user" else "agent"
+                        print(f"[call] {who}: {msg.get('text', '')}", flush=True)
+                    elif kind in ("session.error", "error"):
+                        print(f"[call] AssemblyAI error: {json.dumps(msg)[:500]}", flush=True)
+                    elif kind == "session.ended":
+                        return
+
+            tasks = [asyncio.create_task(caller_to_agent()), asyncio.create_task(agent_to_caller())]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            for t in done:
+                if t.exception() and not isinstance(t.exception(), (WebSocketDisconnect, websockets.ConnectionClosed)):
+                    print(f"[call] bridge error: {t.exception()!r}", flush=True)
+            try:
+                await aai_ws.send(json.dumps({"type": "session.end"}))
+            except websockets.ConnectionClosed:
+                pass
+    except websockets.InvalidStatus as e:
+        print(f"[call] AssemblyAI refused the connection ({e.response.status_code}). "
+              "Check ASSEMBLYAI_API_KEY, AGENT_ID and AAI_WS_URL.", flush=True)
+    except Exception as e:  # keep the server alive whatever happens on one call
+        print(f"[call] error: {e!r}", flush=True)
+    finally:
+        print(f"[call] ended {stream_sid}", flush=True)
+        try:
+            await twilio_ws.close()
+        except Exception:
+            pass
